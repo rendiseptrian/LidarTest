@@ -1,16 +1,23 @@
 import SwiftUI
 import AVFoundation
+import UIKit
 
 struct ContentView: View {
-    @StateObject private var streamer = NetworkStreamer()
-    @StateObject private var meshManager: ARMeshManager
+    @StateObject var streamer = NetworkStreamer()
+    @StateObject var meshManager: ARMeshManager
+    @StateObject var roomScanner: RoomScanManager
+    @State var mode: ScanMode = .rooms
+    @State var confirmNewScan = false
     @State private var isTorchOn: Bool = false
-    @State private var macIPInput: String = "10.60.50.88"
+    @State private var macIPInput: String = ""
 
     init() {
         let st = NetworkStreamer()
+        let mesh = ARMeshManager(streamer: st)
         _streamer = StateObject(wrappedValue: st)
-        _meshManager = StateObject(wrappedValue: ARMeshManager(streamer: st))
+        _meshManager = StateObject(wrappedValue: mesh)
+        // Both engines share the mesh manager's ARSession, so rooms and mesh share one world frame.
+        _roomScanner = StateObject(wrappedValue: RoomScanManager(session: mesh.session, streamer: st))
     }
 
     var body: some View {
@@ -24,23 +31,44 @@ struct ContentView: View {
                 // Network IP Banner
                 ipBanner
 
+                // RoomPlan rooms vs. raw LiDAR detail mesh
+                modePicker
+
                 // Live AR 3D Mesh Viewfinder
                 arMeshViewfinder
 
-                // Live Mesh Telemetry Strip
-                meshTelemetryStrip
+                // Live Telemetry Strip
+                if mode == .rooms {
+                    roomTelemetryStrip
+                } else {
+                    meshTelemetryStrip
+                }
 
                 // Scanning & Session Controls
-                scanningControls
+                if mode == .rooms {
+                    roomControls
+                } else {
+                    scanningControls
+                }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
         }
         .onAppear {
-            streamer.startListening(port: 8088)
-            meshManager.startScanning()
+            // Walking a large room without touching the screen used to auto-lock the phone, which
+            // suspends the app, pauses ARKit and kills the socket mid-scan.
+            UIApplication.shared.isIdleTimerDisabled = true
+            streamer.start()
+            if !roomScanner.isSupported { mode = .detail }
+            meshManager.newScan(meshMode: mode == .detail)
+        }
+        .confirmationDialog("Start a new scan?", isPresented: $confirmNewScan, titleVisibility: .visible) {
+            Button("New Scan (clears rooms and mesh)", role: .destructive) { startNewScan() }
+        } message: {
+            Text("Everything scanned so far is cleared here and on the Mac, and the starting point is reset. Save the scan on the Mac first if you want to keep it.")
         }
         .onDisappear {
+            UIApplication.shared.isIdleTimerDisabled = false
             meshManager.pauseScanning()
             streamer.stop()
         }
@@ -59,7 +87,7 @@ struct ContentView: View {
                         .fontWeight(.bold)
                         .foregroundColor(.white)
                 }
-                Text("iPhone 17 Pro Max • ARKit Mesh")
+                Text(mode == .rooms ? "RoomPlan • rooms, doors, furniture" : "ARKit LiDAR • detail mesh")
                     .font(.caption2)
                     .foregroundColor(.gray)
             }
@@ -69,9 +97,9 @@ struct ContentView: View {
             // Status Badge
             HStack(spacing: 6) {
                 Circle()
-                    .fill(streamer.isConnected ? Color.green : (streamer.isListening ? Color.blue : Color.orange))
+                    .fill(streamer.isConnected ? Color.green : Color.orange)
                     .frame(width: 8, height: 8)
-                Text(streamer.isConnected ? "STREAMING 3D" : (streamer.isListening ? "READY" : "OFFLINE"))
+                Text(streamer.isConnected ? "STREAMING 3D" : "NOT CONNECTED")
                     .font(.caption2)
                     .fontWeight(.bold)
                     .foregroundColor(.white)
@@ -84,39 +112,63 @@ struct ContentView: View {
     }
 
     private var ipBanner: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 4) {
-                    Image(systemName: "wifi")
-                        .foregroundColor(.cyan)
-                        .font(.caption)
-                    Text("iPhone IP: \(streamer.localIPAddress):8088")
-                        .font(.system(.caption, design: .monospaced))
-                        .fontWeight(.bold)
-                        .foregroundColor(.white)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 4) {
+                Image(systemName: streamer.isConnected ? "wifi" : "wifi.exclamationmark")
+                    .foregroundColor(streamer.isConnected ? .cyan : .orange)
+                    .font(.caption)
+                Text(streamer.status.title)
+                    .font(.system(.caption, design: .monospaced))
+                    .fontWeight(.bold)
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                Spacer()
+                if streamer.pendingChunkCount > 0 {
+                    Text("\(streamer.pendingChunkCount) queued")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.orange)
                 }
+            }
+
+            HStack(spacing: 8) {
+                TextField("Mac IP (blank = auto-discover)", text: $macIPInput)
+                    .font(.system(.caption, design: .monospaced))
+                    .keyboardType(.numbersAndPunctuation)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(Color.white.opacity(0.1))
+                    .foregroundColor(.white)
+                    .cornerRadius(6)
+
+                Button(action: {
+                    streamer.manualHost = macIPInput
+                    streamer.reconnectNow()
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                        Text("Connect")
+                            .font(.caption2)
+                            .fontWeight(.bold)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.blue)
+                    .foregroundColor(.white)
+                    .cornerRadius(8)
+                }
+            }
+
+            HStack {
                 Text(meshManager.trackingStatus)
-                    .font(.system(size: 10, design: .monospaced))
                     .foregroundColor(.green)
+                Spacer()
+                Text(streamer.discoveredMacs.isEmpty ? "No Mac found yet" : "Found: \(streamer.discoveredMacs.joined(separator: ", "))")
+                    .foregroundColor(.gray)
+                    .lineLimit(1)
             }
-
-            Spacer()
-
-            Button(action: {
-                streamer.connectToMac(host: macIPInput, port: 8088)
-            }) {
-                HStack(spacing: 4) {
-                    Image(systemName: "arrow.up.forward.circle.fill")
-                    Text("Push to Mac")
-                        .font(.caption2)
-                        .fontWeight(.bold)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(Color.blue)
-                .foregroundColor(.white)
-                .cornerRadius(8)
-            }
+            .font(.system(size: 10, design: .monospaced))
         }
         .padding(10)
         .background(Color.white.opacity(0.08))
@@ -128,11 +180,17 @@ struct ContentView: View {
             RoundedRectangle(cornerRadius: 16)
                 .fill(Color.gray.opacity(0.2))
 
-            ARSCNViewContainer(session: meshManager.session)
-                .cornerRadius(16)
+            if mode == .rooms {
+                RoomCaptureViewContainer(captureView: roomScanner.captureView)
+                    .cornerRadius(16)
+                roomOverlay
+            } else {
+                ARSCNViewContainer(session: meshManager.session)
+                    .cornerRadius(16)
+            }
 
             // Top-Right Live Mesh HUD
-            VStack {
+            if mode == .detail { VStack {
                 HStack {
                     Spacer()
                     VStack(alignment: .trailing, spacing: 3) {
@@ -152,7 +210,7 @@ struct ContentView: View {
                     .padding(10)
                 }
                 Spacer()
-            }
+            } }
         }
         .frame(maxHeight: .infinity)
     }
@@ -212,7 +270,7 @@ struct ContentView: View {
 
                 // Reset Scan
                 Button(action: {
-                    meshManager.resetScan()
+                    confirmNewScan = true
                 }) {
                     HStack(spacing: 6) {
                         Image(systemName: "arrow.counterclockwise")

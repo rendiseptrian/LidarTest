@@ -3,320 +3,428 @@ import Network
 import Combine
 import QuartzCore
 
+/// Pushes the live ARKit mesh to the Mac. The iPhone is always the client; the Mac only listens.
+///
+/// Delivery model — the phone is the source of truth and the Mac is a mirror:
+/// - `snapshot` holds the latest payload of every live anchor, whether or not anything is connected.
+/// - On every (re)connect the Mac first gets a `.sync` manifest (so chunks removed while offline
+///   disappear), then every snapshot chunk is resent. Anything lost when a connection died is
+///   therefore recovered on the next one; nothing depends on a chunk happening to update again.
+/// - Within a connection, a chunk is only queued once; later updates replace it in `snapshot`
+///   so only the newest version is ever sent.
 @MainActor
 public final class NetworkStreamer: ObservableObject {
-    @Published public private(set) var isListening: Bool = false
+    public enum Status: Equatable {
+        case idle
+        case searching
+        case connecting(String)
+        case connected(String)
+        case waiting(String)
+
+        public var title: String {
+            switch self {
+            case .idle: return "Offline"
+            case .searching: return "Searching for Mac…"
+            case .connecting(let h): return "Connecting to \(h)…"
+            case .connected(let h): return "Streaming to \(h)"
+            case .waiting(let reason): return "Retrying: \(reason)"
+            }
+        }
+    }
+
+    @Published public private(set) var status: Status = .idle
     @Published public private(set) var isConnected: Bool = false
-    @Published public private(set) var clientEndpoint: String = ""
+    @Published public private(set) var discoveredMacs: [String] = []
     @Published public private(set) var localIPAddress: String = "Detecting IP..."
     @Published public private(set) var fps: Double = 0.0
     @Published public private(set) var bytesSentTotal: Int64 = 0
+    @Published public private(set) var pendingChunkCount: Int = 0
     @Published public private(set) var lastError: String?
 
-    // Support connecting out to Mac as client
-    @Published public var targetMacHost: String = "10.60.50.88"
-    @Published public var isClientMode: Bool = false
+    /// Empty = find the Mac automatically over Bonjour. Otherwise connect to this host/IP directly.
+    @Published public var manualHost: String = ""
 
-    private var listener: NWListener?
-    private var activeConnection: NWConnection?
+    // Tuning
+    private let port = NetworkUtils.defaultPort
+    /// Minimum gap between two sends of the same anchor. ARKit refines anchors continuously;
+    /// sending each refinement would starve brand-new areas of bandwidth.
+    private let perChunkMinInterval: TimeInterval = 0.5
+    /// Uncompressed bytes allowed on the wire at once. Lets several chunks be in flight instead of
+    /// one round trip per chunk, while still bounding how much sits in the socket buffer.
+    private let inFlightByteBudget = 4 * 1024 * 1024
+    private let heartbeatInterval: TimeInterval = 2.0
+    private let maxReconnectDelay: TimeInterval = 5.0
 
-    // Backpressure & Batching queue to prevent socket buffer exhaustion
-    private var pendingMeshChunks: [UUID: MeshChunkPayload] = [:]
-    private var pendingChunkOrder: [UUID] = []
-    private var isSendingMesh: Bool = false
+    // Mesh state (survives disconnects)
+    private var snapshot: [UUID: MeshChunkPayload] = [:]
 
-    // Auto-reconnect & Heartbeat
+    // Per-connection send state
+    private var pendingOrder: [UUID] = []
+    private var pendingSet: Set<UUID> = []
+    private var sentOnConnection: Set<UUID> = []
+    private var lastSentAt: [UUID: TimeInterval] = [:]
+    private var inFlightBytes = 0
+    private var lastSendTime: TimeInterval = 0
+
+    // Connection
+    private var isRunning = false
+    private var browser: NWBrowser?
+    private var browseResults: [NWEndpoint] = []
+    private var connection: NWConnection?
+    private var connectionGeneration = 0
     private var reconnectTask: Task<Void, Never>?
-    private var heartbeatTimer: Timer?
-    private var frameCount: Int = 0
-    private var lastFPSUpdateTime: TimeInterval = 0
+    private var reconnectAttempts = 0
+    private var pumpTimer: Timer?
+    /// Encoding and `send` happen here, in order, so the main thread never compresses and the
+    /// byte order on the wire matches the order chunks were picked.
+    private let encodeQueue = DispatchQueue(label: "mesh.encode", qos: .userInitiated)
+
+    // Metrics
+    private var chunksSinceMetric = 0
+    private var lastMetricTime: TimeInterval = CACurrentMediaTime()
 
     public init() {
         refreshIP()
     }
 
     public func refreshIP() {
-        if let ip = NetworkUtils.getLocalIPAddress() {
-            self.localIPAddress = ip
-        } else {
-            self.localIPAddress = "127.0.0.1"
-        }
+        localIPAddress = NetworkUtils.getLocalIPAddress() ?? "No Wi-Fi"
     }
 
-    // MARK: - Server Mode (iPhone listens, Mac connects)
+    // MARK: - Lifecycle
 
-    public func startListening(port: UInt16 = 8088) {
-        stop()
+    public func start() {
+        guard !isRunning else { return }
+        isRunning = true
         refreshIP()
-        isClientMode = false
-
-        do {
-            let nwPort = NWEndpoint.Port(rawValue: port) ?? NWEndpoint.Port(8088)
-            let tcpOptions = NWProtocolTCP.Options()
-            tcpOptions.enableFastOpen = true
-            tcpOptions.noDelay = true
-            tcpOptions.enableKeepalive = true
-            tcpOptions.keepaliveIdle = 2
-            tcpOptions.keepaliveInterval = 1
-            tcpOptions.keepaliveCount = 5
-
-            let params = NWParameters(tls: nil, tcp: tcpOptions)
-            params.allowLocalEndpointReuse = true
-            params.includePeerToPeer = true
-            params.serviceClass = .interactiveVideo
-
-            let newListener = try NWListener(using: params, on: nwPort)
-            newListener.service = NWListener.Service(type: "_lidartest._tcp")
-
-            newListener.stateUpdateHandler = { [weak self] state in
-                Task { @MainActor [weak self] in
-                    guard let self = self else { return }
-                    switch state {
-                    case .ready:
-                        self.isListening = true
-                        self.lastError = nil
-                    case .failed(let error):
-                        self.isListening = false
-                        self.lastError = "Listener failed: \(error.localizedDescription)"
-                    case .cancelled:
-                        self.isListening = false
-                    default:
-                        break
-                    }
-                }
-            }
-
-            newListener.newConnectionHandler = { [weak self] newConnection in
-                Task { @MainActor [weak self] in
-                    self?.handleNewConnection(newConnection)
-                }
-            }
-
-            newListener.start(queue: .main)
-            self.listener = newListener
-            self.lastFPSUpdateTime = CACurrentMediaTime()
-        } catch {
-            self.lastError = "Failed to create listener: \(error.localizedDescription)"
-        }
-    }
-
-    // MARK: - Client Mode (iPhone connects to Mac)
-
-    public func connectToMac(host: String, port: UInt16 = 8088) {
-        stop()
-        refreshIP()
-        isClientMode = true
-        self.targetMacHost = host
-
-        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-
-        let endpointHost = NWEndpoint.Host(trimmed)
-        let endpointPort = NWEndpoint.Port(rawValue: port) ?? NWEndpoint.Port(8088)
-
-        let tcpOptions = NWProtocolTCP.Options()
-        tcpOptions.enableFastOpen = true
-        tcpOptions.noDelay = true
-        tcpOptions.enableKeepalive = true
-        tcpOptions.keepaliveIdle = 2
-        tcpOptions.keepaliveInterval = 1
-        tcpOptions.keepaliveCount = 5
-
-        let params = NWParameters(tls: nil, tcp: tcpOptions)
-        params.allowLocalEndpointReuse = true
-        params.includePeerToPeer = true
-        params.serviceClass = .interactiveVideo
-
-        let connection = NWConnection(host: endpointHost, port: endpointPort, using: params)
-        handleNewConnection(connection)
+        startBrowsing()
+        startPump()
+        connectIfPossible()
     }
 
     public func stop() {
+        isRunning = false
         reconnectTask?.cancel()
         reconnectTask = nil
-        heartbeatTimer?.invalidate()
-        heartbeatTimer = nil
-
-        activeConnection?.cancel()
-        activeConnection = nil
-        listener?.cancel()
-        listener = nil
-
-        pendingMeshChunks.removeAll()
-        pendingChunkOrder.removeAll()
-        isSendingMesh = false
-
-        isListening = false
-        isConnected = false
-        clientEndpoint = ""
+        pumpTimer?.invalidate()
+        pumpTimer = nil
+        browser?.cancel()
+        browser = nil
+        browseResults = []
+        discoveredMacs = []
+        teardownConnection()
+        status = .idle
     }
 
-    private func handleNewConnection(_ connection: NWConnection) {
-        activeConnection?.cancel()
-        activeConnection = connection
+    /// Apply a changed `manualHost` (or retry right now after a failure).
+    public func reconnectNow() {
+        guard isRunning else { return start() }
+        reconnectAttempts = 0
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        teardownConnection()
+        connectIfPossible()
+    }
 
-        connection.stateUpdateHandler = { [weak self] state in
+    // MARK: - Mesh API (called by ARMeshManager)
+
+    public func upsert(_ payload: MeshChunkPayload) {
+        snapshot[payload.id] = payload
+        markPending(payload.id)
+        drain()
+    }
+
+    public func remove(id: UUID) {
+        snapshot.removeValue(forKey: id)
+        markPending(id)
+        drain()
+    }
+
+    /// A new scan started: forget everything. If nothing is connected, the empty `.sync` manifest
+    /// sent on the next connect clears the Mac instead.
+    public func resetScan() {
+        snapshot.removeAll()
+        pendingOrder.removeAll()
+        pendingSet.removeAll()
+        sentOnConnection.removeAll()
+        lastSentAt.removeAll()
+        pendingChunkCount = 0
+        if isConnected {
+            enqueueSend(MeshChunkPayload(id: UUID(), action: .reset))
+        }
+    }
+
+    // MARK: - Discovery
+
+    private func startBrowsing() {
+        let params = NWParameters()
+        params.includePeerToPeer = true
+        let browser = NWBrowser(for: .bonjour(type: NetworkUtils.bonjourServiceType, domain: nil), using: params)
+
+        browser.browseResultsChangedHandler = { [weak self] results, _ in
+            let endpoints = results.map(\.endpoint)
             Task { @MainActor [weak self] in
-                guard let self = self else { return }
+                guard let self else { return }
+                self.browseResults = endpoints
+                self.discoveredMacs = endpoints.map(Self.displayName(for:))
+                if !self.isConnected, self.connection == nil {
+                    self.connectIfPossible()
+                }
+            }
+        }
+        browser.stateUpdateHandler = { [weak self] state in
+            Task { @MainActor [weak self] in
+                guard let self, self.isRunning, self.browser === browser else { return }
                 switch state {
                 case .ready:
-                    self.isConnected = true
-                    self.clientEndpoint = "\(connection.endpoint)"
-                    self.lastError = nil
-                    self.reconnectTask?.cancel()
-                    self.reconnectTask = nil
-                    self.startHeartbeat()
-                    self.drainMeshQueue()
+                    if self.lastError?.hasPrefix("Discovery") == true { self.lastError = nil }
+                case .waiting(let error):
+                    // Typically Local Network access denied; the browser resumes on its own once
+                    // access is granted, so just explain what to do.
+                    self.lastError = "Discovery: \(Self.describe(error))"
                 case .failed(let error):
-                    self.handleDisconnection(reason: "Connection failed: \(error.localizedDescription)")
-                case .cancelled:
-                    self.handleDisconnection(reason: nil)
+                    self.lastError = "Discovery: \(Self.describe(error))"
+                    browser.cancel()
+                    self.browser = nil
+                    self.scheduleBrowserRestart()
                 default:
                     break
                 }
             }
         }
-
-        connection.start(queue: .main)
+        browser.start(queue: .main)
+        self.browser = browser
     }
 
-    private func handleDisconnection(reason: String?) {
+    private func scheduleBrowserRestart() {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard let self, self.isRunning, self.browser == nil else { return }
+            self.startBrowsing()
+        }
+    }
+
+    /// Turns the DNS-SD error codes iOS reports into something actionable.
+    private static func describe(_ error: NWError) -> String {
+        if case .dns(let code) = error {
+            switch Int(code) {
+            case -65570: // kDNSServiceErr_PolicyDenied
+                return "Local Network access is off. Enable it in Settings › Privacy & Security › Local Network › LiDAR Capture."
+            case -65555: // kDNSServiceErr_NoAuth
+                return "This build doesn't declare the Bonjour service (NSBonjourServices). Reinstall the latest build, or type the Mac's IP."
+            default:
+                break
+            }
+        }
+        return "\(error.localizedDescription). Type the Mac's IP to connect directly."
+    }
+
+    private static func displayName(for endpoint: NWEndpoint) -> String {
+        if case .service(let name, _, _, _) = endpoint { return name }
+        return "\(endpoint)"
+    }
+
+    // MARK: - Connection
+
+    private func connectIfPossible() {
+        guard isRunning, connection == nil else { return }
+
+        let endpoint: NWEndpoint
+        let label: String
+        let host = manualHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !host.isEmpty {
+            endpoint = .hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!)
+            label = host
+        } else if let found = browseResults.first {
+            endpoint = found
+            label = Self.displayName(for: found)
+        } else {
+            status = .searching
+            return
+        }
+
+        connectionGeneration += 1
+        let generation = connectionGeneration
+        let conn = NWConnection(to: endpoint, using: NetworkUtils.makeTCPParameters())
+        connection = conn
+        status = .connecting(label)
+
+        conn.stateUpdateHandler = { [weak self] state in
+            Task { @MainActor [weak self] in
+                guard let self, generation == self.connectionGeneration else { return }
+                switch state {
+                case .ready:
+                    self.handleReady(label: label)
+                case .waiting(let error):
+                    // Refused / unreachable. NWConnection would only retry on a path change, so
+                    // drop it and retry on our own schedule.
+                    self.handleConnectionLoss(reason: Self.describe(error))
+                case .failed(let error):
+                    self.handleConnectionLoss(reason: Self.describe(error))
+                case .cancelled:
+                    break
+                default:
+                    break
+                }
+            }
+        }
+        conn.start(queue: .main)
+    }
+
+    private func handleReady(label: String) {
+        isConnected = true
+        status = .connected(label)
+        lastError = nil
+        reconnectAttempts = 0
+        reconnectTask?.cancel()
+        reconnectTask = nil
+
+        // Fresh mirror: manifest first, then resend everything the phone currently holds.
+        sentOnConnection.removeAll()
+        lastSentAt.removeAll()
+        inFlightBytes = 0
+        pendingOrder = Array(snapshot.keys)
+        pendingSet = Set(pendingOrder)
+        pendingChunkCount = pendingOrder.count
+        enqueueSend(MeshChunkPayload.syncManifest(ids: Array(snapshot.keys)))
+        drain()
+    }
+
+    private func handleConnectionLoss(reason: String) {
+        lastError = reason
+        teardownConnection()
+        scheduleReconnect(reason: reason)
+    }
+
+    private func teardownConnection() {
+        connectionGeneration += 1 // invalidates callbacks from the old connection
+        connection?.stateUpdateHandler = nil
+        connection?.cancel()
+        connection = nil
         isConnected = false
-        clientEndpoint = ""
-        isSendingMesh = false
-        heartbeatTimer?.invalidate()
-        heartbeatTimer = nil
+        inFlightBytes = 0
+    }
 
-        if let reason = reason {
-            self.lastError = reason
-        }
-
-        // Auto-reconnect if we were in client push mode
-        if isClientMode && reconnectTask == nil {
-            reconnectTask = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 1_500_000_000) // wait 1.5s
-                guard !Task.isCancelled, !self.isConnected, self.isClientMode else { return }
-                self.connectToMac(host: self.targetMacHost)
-            }
+    private func scheduleReconnect(reason: String) {
+        guard isRunning, reconnectTask == nil else { return }
+        reconnectAttempts += 1
+        let delay = min(Double(reconnectAttempts), maxReconnectDelay)
+        status = .waiting(reason)
+        reconnectTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            self.reconnectTask = nil
+            self.connectIfPossible()
         }
     }
 
-    private func startHeartbeat() {
-        heartbeatTimer?.invalidate()
-        // Send a tiny empty probe every 3 seconds if idle to keep Wi-Fi awake
-        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+    // MARK: - Send queue
+
+    private func markPending(_ id: UUID) {
+        if pendingSet.insert(id).inserted {
+            pendingOrder.append(id)
+        }
+        pendingChunkCount = pendingOrder.count
+    }
+
+    private func startPump() {
+        pumpTimer?.invalidate()
+        // Re-checks rate-limited chunks and sends heartbeats; cheap when there is nothing to do.
+        pumpTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self = self, self.isConnected, !self.isSendingMesh, self.pendingChunkOrder.isEmpty else { return }
-                // Heartbeat packet
-                let ping = MeshChunkPayload(id: UUID(), action: .addOrUpdate, vertexCount: 0, faceCount: 0)
-                let data = ping.serializeWithLengthPrefix()
-                self.activeConnection?.send(content: data, completion: .idempotent)
+                guard let self else { return }
+                self.drain()
+                self.sendHeartbeatIfIdle()
             }
         }
     }
 
-    // MARK: - Queue-Managed Mesh Streaming (Prevents Disconnects)
+    private func drain() {
+        guard isConnected, connection != nil else { return }
+        let now = CACurrentMediaTime()
 
-    /// Queues a mesh chunk. Replaces older versions of the same chunk to minimize bandwidth.
-    public func sendMesh(payload: MeshChunkPayload) {
-        guard isConnected else { return }
+        while inFlightBytes < inFlightByteBudget, let index = nextPendingIndex(now: now) {
+            let id = pendingOrder.remove(at: index)
+            pendingSet.remove(id)
 
-        // If reset action, flush queue immediately
-        if payload.action == .reset {
-            pendingMeshChunks.removeAll()
-            pendingChunkOrder.removeAll()
-            sendDirect(payload: payload)
+            if let payload = snapshot[id] {
+                sentOnConnection.insert(id)
+                lastSentAt[id] = now
+                enqueueSend(payload)
+            } else {
+                sentOnConnection.remove(id)
+                lastSentAt.removeValue(forKey: id)
+                enqueueSend(MeshChunkPayload(id: id, action: .remove))
+            }
+        }
+        pendingChunkCount = pendingOrder.count
+    }
+
+    /// Removals and never-sent chunks first (new areas of the room appear promptly), then
+    /// refinements of chunks the Mac already has, each no more often than `perChunkMinInterval`.
+    private func nextPendingIndex(now: TimeInterval) -> Int? {
+        var firstEligibleUpdate: Int?
+        for (index, id) in pendingOrder.enumerated() {
+            if snapshot[id] == nil || !sentOnConnection.contains(id) {
+                return index
+            }
+            if firstEligibleUpdate == nil, now - (lastSentAt[id] ?? 0) >= perChunkMinInterval {
+                firstEligibleUpdate = index
+            }
+        }
+        return firstEligibleUpdate
+    }
+
+    private func enqueueSend(_ payload: MeshChunkPayload) {
+        guard let conn = connection else { return }
+        let generation = connectionGeneration
+        let estimate = payload.vertexData.count + payload.normalData.count
+            + payload.faceData.count + payload.classificationData.count + 256
+        inFlightBytes += estimate
+        lastSendTime = CACurrentMediaTime()
+        let countsAsChunk = payload.action == .addOrUpdate
+
+        let completed: @Sendable (NWError?, Int) -> Void = { [weak self] error, wireBytes in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    self?.sendCompleted(generation: generation, estimate: estimate, wireBytes: wireBytes,
+                                        countsAsChunk: countsAsChunk, error: error)
+                }
+            }
+        }
+
+        encodeQueue.async {
+            let frame = MeshFrameCodec.encode(payload)
+            conn.send(content: frame, completion: .contentProcessed { error in
+                completed(error, frame.count)
+            })
+        }
+    }
+
+    private func sendCompleted(generation: Int, estimate: Int, wireBytes: Int, countsAsChunk: Bool, error: NWError?) {
+        guard generation == connectionGeneration else { return }
+        inFlightBytes = max(0, inFlightBytes - estimate)
+
+        if let error {
+            // The chunks in flight are not lost: they are still in `snapshot` and get resent on
+            // the next connection.
+            handleConnectionLoss(reason: "Send failed: \(error.localizedDescription)")
             return
         }
 
-        if pendingMeshChunks[payload.id] == nil {
-            pendingChunkOrder.append(payload.id)
+        bytesSentTotal += Int64(wireBytes)
+        if countsAsChunk { chunksSinceMetric += 1 }
+        let now = CACurrentMediaTime()
+        if now - lastMetricTime >= 1.0 {
+            fps = Double(chunksSinceMetric) / (now - lastMetricTime)
+            chunksSinceMetric = 0
+            lastMetricTime = now
         }
-        pendingMeshChunks[payload.id] = payload
-
-        if !isSendingMesh {
-            drainMeshQueue()
-        }
+        drain()
     }
 
-    private func drainMeshQueue() {
-        guard isConnected, !isSendingMesh, let connection = activeConnection else { return }
-        guard !pendingChunkOrder.isEmpty else { return }
-
-        let nextId = pendingChunkOrder.removeFirst()
-        guard let payload = pendingMeshChunks.removeValue(forKey: nextId) else {
-            drainMeshQueue()
-            return
-        }
-
-        isSendingMesh = true
-        let data = payload.serializeWithLengthPrefix()
-        let count = data.count
-
-        connection.send(content: data, completion: .contentProcessed { [weak self] error in
-            Task { @MainActor [weak self] in
-                guard let self = self else { return }
-                self.isSendingMesh = false
-
-                if let error = error {
-                    self.lastError = "Send error: \(error.localizedDescription)"
-                } else {
-                    self.bytesSentTotal += Int64(count)
-                    self.frameCount += 1
-
-                    let now = CACurrentMediaTime()
-                    let elapsed = now - self.lastFPSUpdateTime
-                    if elapsed >= 1.0 {
-                        self.fps = Double(self.frameCount) / elapsed
-                        self.frameCount = 0
-                        self.lastFPSUpdateTime = now
-                    }
-                }
-
-                // Continue draining queue one by one without flooding socket
-                self.drainMeshQueue()
-            }
-        })
-    }
-
-    private func sendDirect(payload: MeshChunkPayload) {
-        guard isConnected, let connection = activeConnection else { return }
-        let data = payload.serializeWithLengthPrefix()
-        connection.send(content: data, completion: .contentProcessed { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.drainMeshQueue()
-            }
-        })
-    }
-
-    /// Transmits a LidarPacket to the connected client with backpressure check.
-    public func send(packet: LidarPacket) {
-        guard isConnected, let connection = activeConnection, !isSendingMesh else { return }
-
-        isSendingMesh = true
-        let data = packet.serializeWithLengthPrefix()
-        let count = data.count
-
-        connection.send(content: data, completion: .contentProcessed { [weak self] error in
-            Task { @MainActor [weak self] in
-                guard let self = self else { return }
-                self.isSendingMesh = false
-
-                if let error = error {
-                    self.lastError = "Send error: \(error.localizedDescription)"
-                } else {
-                    self.bytesSentTotal += Int64(count)
-                    self.frameCount += 1
-
-                    let now = CACurrentMediaTime()
-                    let elapsed = now - self.lastFPSUpdateTime
-                    if elapsed >= 1.0 {
-                        self.fps = Double(self.frameCount) / elapsed
-                        self.frameCount = 0
-                        self.lastFPSUpdateTime = now
-                    }
-                }
-            }
-        })
+    private func sendHeartbeatIfIdle() {
+        guard isConnected, CACurrentMediaTime() - lastSendTime >= heartbeatInterval else { return }
+        enqueueSend(.heartbeat())
     }
 }

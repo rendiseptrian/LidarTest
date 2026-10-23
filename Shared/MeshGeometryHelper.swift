@@ -9,7 +9,7 @@ import UIKit
 public typealias PlatformColor = UIColor
 #endif
 
-public enum MeshRenderMode: String, CaseIterable, Identifiable {
+nonisolated public enum MeshRenderMode: String, CaseIterable, Identifiable, Sendable {
     case realistic = "Realistic (PBR)"
     case solid = "Studio Clay"
     case wireframe = "Neon Wireframe"
@@ -18,7 +18,7 @@ public enum MeshRenderMode: String, CaseIterable, Identifiable {
     public var id: String { rawValue }
 }
 
-public struct MeshGeometryHelper {
+nonisolated public struct MeshGeometryHelper {
     /// Creates a hardware-rendered SCNGeometry from a serialized MeshChunkPayload with realistic materials.
     public static func makeGeometry(from payload: MeshChunkPayload, mode: MeshRenderMode = .realistic) -> SCNGeometry? {
         guard payload.vertexCount > 0, payload.faceCount > 0 else { return nil }
@@ -96,8 +96,12 @@ public struct MeshGeometryHelper {
         let faceCount = payload.faceCount
         guard faceCount > 0, payload.faceData.count >= faceCount * 3 * MemoryLayout<Int32>.size else { return nil }
 
-        // Group triangle indices by classification byte (0 to 7)
-        var classIndices: [UInt8: [Int32]] = [:]
+        // Group triangle indices by classification byte. Two passes over flat arrays: count, then
+        // fill. The previous dictionary-of-arrays append ran per face on the main thread and was
+        // the dominant cost of every chunk update in large scans.
+        let classCount = 256
+        var counts = [Int](repeating: 0, count: classCount)
+        var classIndices = [[Int32]](repeating: [], count: classCount)
 
         payload.faceData.withUnsafeBytes { facePtr in
             let int32Ptr = facePtr.bindMemory(to: Int32.self)
@@ -105,17 +109,16 @@ public struct MeshGeometryHelper {
                 let bytePtr = classPtr.bindMemory(to: UInt8.self)
 
                 for f in 0..<faceCount {
-                    let c = bytePtr[f]
-                    let i0 = int32Ptr[f * 3]
-                    let i1 = int32Ptr[f * 3 + 1]
-                    let i2 = int32Ptr[f * 3 + 2]
-
-                    if classIndices[c] == nil {
-                        classIndices[c] = []
-                    }
-                    classIndices[c]?.append(i0)
-                    classIndices[c]?.append(i1)
-                    classIndices[c]?.append(i2)
+                    counts[Int(bytePtr[f])] += 1
+                }
+                for c in 0..<classCount where counts[c] > 0 {
+                    classIndices[c].reserveCapacity(counts[c] * 3)
+                }
+                for f in 0..<faceCount {
+                    let c = Int(bytePtr[f])
+                    classIndices[c].append(int32Ptr[f * 3])
+                    classIndices[c].append(int32Ptr[f * 3 + 1])
+                    classIndices[c].append(int32Ptr[f * 3 + 2])
                 }
             }
         }
@@ -123,11 +126,9 @@ public struct MeshGeometryHelper {
         var elements: [SCNGeometryElement] = []
         var materials: [SCNMaterial] = []
 
-        // Sort keys so material ordering matches element ordering
-        let sortedClasses = classIndices.keys.sorted()
-
-        for c in sortedClasses {
-            guard let indices = classIndices[c], !indices.isEmpty else { continue }
+        for c in 0..<classCount {
+            let indices = classIndices[c]
+            guard !indices.isEmpty else { continue }
             let data = indices.withUnsafeBufferPointer { Data(buffer: $0) }
             let elem = SCNGeometryElement(
                 data: data,
@@ -136,7 +137,7 @@ public struct MeshGeometryHelper {
                 bytesPerIndex: MemoryLayout<Int32>.size
             )
             elements.append(elem)
-            materials.append(materialForClassification(c))
+            materials.append(materialForClassification(UInt8(c)))
         }
 
         guard !elements.isEmpty else { return nil }

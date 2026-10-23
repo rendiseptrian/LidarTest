@@ -1,6 +1,32 @@
 import Foundation
+import Network
 
-public struct NetworkUtils {
+nonisolated public struct NetworkUtils {
+    /// Must match `NSBonjourServices` in the iOS target's build settings, or iOS refuses to advertise it.
+    public static let bonjourServiceType = "_lidar-stream._tcp"
+    public static let defaultPort: UInt16 = 8088
+
+    /// Shared TCP tuning for both ends of the mesh stream.
+    ///
+    /// Keepalive gives up after ~40 s of silence (10 s idle + 6 × 5 s probes). The previous 2/1/5
+    /// setting killed the socket after ~7 s, which a Wi-Fi access-point handoff while walking a
+    /// large room routinely exceeds. Liveness is also checked at the app level via heartbeats.
+    public static func makeTCPParameters() -> NWParameters {
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true
+        tcpOptions.enableKeepalive = true
+        tcpOptions.keepaliveIdle = 10
+        tcpOptions.keepaliveInterval = 5
+        tcpOptions.keepaliveCount = 6
+
+        let params = NWParameters(tls: nil, tcp: tcpOptions)
+        params.allowLocalEndpointReuse = true
+        params.includePeerToPeer = true
+        // Bulk mesh transfer, not latency-critical video.
+        params.serviceClass = .responsiveData
+        return params
+    }
+
     /// Returns the active local IPv4 address (Wi-Fi or Ethernet)
     public static func getLocalIPAddress() -> String? {
         var address: String?

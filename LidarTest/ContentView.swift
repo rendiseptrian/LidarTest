@@ -3,6 +3,7 @@ import SceneKit
 
 struct ContentView: View {
     @StateObject private var receiver = MeshReceiver()
+    @StateObject private var measurements = MeasurementStore()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -16,8 +17,12 @@ struct ContentView: View {
 
             // Main 3D Viewport
             ZStack(alignment: .topTrailing) {
-                SceneKitMeshView(receiver: receiver)
+                SceneKitMeshView(receiver: receiver, measurements: measurements)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                MeasurementLabelsOverlay(store: measurements) { point in
+                    receiver.sceneCoordinator?.screenPoint(of: point)
+                }
 
                 // 3D Viewport Floating Overlay Controls
                 viewportOverlayControls
@@ -45,7 +50,7 @@ struct ContentView: View {
         .frame(minWidth: 1100, minHeight: 740)
         .background(Color(NSColor.underPageBackgroundColor))
         .onAppear {
-            receiver.startListening(port: 8088)
+            receiver.startListening()
         }
     }
 
@@ -77,49 +82,36 @@ struct ContentView: View {
 
             Spacer()
 
-            // Connection controls
+            // Listen-only: the iPhone finds this Mac over Bonjour and connects to it.
             HStack(spacing: 8) {
-                // Host input field
                 HStack {
                     Image(systemName: "network")
                         .foregroundColor(.secondary)
-                    TextField("Host / IP", text: $receiver.host)
-                        .textFieldStyle(.plain)
+                    Text(verbatim: "\(receiver.localIP):\(receiver.port)")
                         .font(.system(.subheadline, design: .monospaced))
-                        .frame(width: 140)
+                        .textSelection(.enabled)
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
                 .background(Color(NSColor.controlBackgroundColor))
                 .cornerRadius(8)
                 .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.2), lineWidth: 1))
+                .help("The iPhone finds this Mac automatically. Type this IP on the iPhone only if discovery fails.")
 
-                // Connect / Disconnect / Listen buttons
-                if case .connected = receiver.status {
-                    Button(action: { receiver.disconnect() }) {
-                        Label("Disconnect", systemImage: "xmark.circle.fill")
+                if receiver.isListening {
+                    Button(action: { receiver.stopListening() }) {
+                        Label("Stop", systemImage: "stop.circle.fill")
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.red)
-                } else if receiver.isListening {
-                    Button(action: { receiver.disconnect() }) {
-                        Label("Stop Listening", systemImage: "stop.circle.fill")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.orange)
+                    .buttonStyle(.bordered)
                 } else {
-                    Button(action: { receiver.connect() }) {
-                        Label("Connect", systemImage: "bolt.fill")
+                    Button(action: { receiver.startListening() }) {
+                        Label("Listen", systemImage: "antenna.radiowaves.left.and.right")
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.blue)
-
-                    Button(action: { receiver.startListening(port: 8088) }) {
-                        Label("Listen Mode", systemImage: "antenna.radiowaves.left.and.right")
-                    }
-                    .buttonStyle(.bordered)
-                    .help("Listen on \(receiver.localIP):8088 so iPhone can tap 'Push to Mac'")
                 }
+
+                ScanExportMenu(receiver: receiver, measurements: measurements)
 
                 Button(action: { receiver.clearScene() }) {
                     Image(systemName: "trash")
@@ -159,8 +151,8 @@ struct ContentView: View {
     private var statusColor: Color {
         switch receiver.status {
         case .connected: return .green
-        case .connecting, .searching: return .orange
-        case .disconnected: return .gray
+        case .listening: return .orange
+        case .stopped: return .gray
         case .failed: return .red
         }
     }
@@ -185,6 +177,8 @@ struct ContentView: View {
 
     private var viewportOverlayControls: some View {
         HStack(spacing: 10) {
+            MapControls(receiver: receiver, measurements: measurements)
+
             // Render Mode Picker
             Picker("", selection: $receiver.renderMode) {
                 ForEach(MeshRenderMode.allCases) { mode in
@@ -202,12 +196,29 @@ struct ContentView: View {
             .buttonStyle(.bordered)
             .help("Toggle Ground Grid")
 
+            // Measure Toggle
+            Button(action: { measurements.isActive.toggle() }) {
+                Label("Measure", systemImage: "ruler")
+                    .foregroundColor(measurements.isActive ? .yellow : .secondary)
+            }
+            .buttonStyle(.bordered)
+            .help("Measure distances by clicking two points on the mesh")
+
+            if measurements.isActive {
+                Button(action: { measurements.cancel() }) {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.bordered)
+                .keyboardShortcut(.cancelAction)
+                .help(measurements.pendingPoint == nil ? "Exit Measure (Esc)" : "Cancel Point (Esc)")
+            }
+
             // Reset Camera Button
-            Button(action: { receiver.sceneCoordinator?.resetCamera() }) {
+            Button(action: { receiver.frameScene() }) {
                 Image(systemName: "camera.viewfinder")
             }
             .buttonStyle(.bordered)
-            .help("Reset Camera View")
+            .help("Frame Scanned Area")
         }
         .padding(8)
         .background(Color.black.opacity(0.75))
@@ -217,9 +228,17 @@ struct ContentView: View {
 
     private var navigationHintTag: some View {
         HStack(spacing: 12) {
-            Label("Orbit: Left Drag", systemImage: "arrow.triangle.2.circlepath")
-            Label("Pan: Right Drag / Two Fingers", systemImage: "hand.draw")
-            Label("Zoom: Scroll", systemImage: "magnifyingglass")
+            if measurements.isActive {
+                Label(measurements.pendingPoint == nil ? "Click: First Point" : "Click: Second Point", systemImage: "ruler")
+                    .foregroundColor(.yellow)
+                Label("⌥ Click: Snap to Vertex", systemImage: "smallcircle.filled.circle")
+                Label("Esc: Cancel", systemImage: "escape")
+                Label("Orbit: Left Drag", systemImage: "arrow.triangle.2.circlepath")
+            } else {
+                Label("Orbit: Left Drag", systemImage: "arrow.triangle.2.circlepath")
+                Label("Pan: Right Drag / Two Fingers", systemImage: "hand.draw")
+                Label("Zoom: Scroll", systemImage: "magnifyingglass")
+            }
         }
         .font(.system(size: 11, design: .monospaced))
         .foregroundColor(.white.opacity(0.85))
@@ -276,7 +295,22 @@ struct ContentView: View {
                 }
             }
 
-            // Card 4: Sensor & Reconstruction Engine
+            // Card 4: Measurements
+            inspectorCard(title: "Measurements", icon: "ruler") {
+                MeasurementListView(store: measurements)
+            }
+            .overlay(alignment: .topTrailing) {
+                if !measurements.measurements.isEmpty {
+                    Button("Clear All") { measurements.removeAll() }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                        .padding(8)
+                        .help("Delete All Measurements")
+                }
+            }
+            .frame(minWidth: 330)
+
+            // Card 5: Sensor & Reconstruction Engine
             inspectorCard(title: "Reconstruction Engine", icon: "cpu") {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Apple ARKit Scene Reconstruction")

@@ -37,36 +37,44 @@ public struct ARSCNViewContainer: UIViewRepresentable {
             updateNode(node, for: meshAnchor)
         }
 
+        /// Preview only. Wraps ARKit's own Metal vertex buffer instead of copying it, and skips
+        /// normals and classification, so the on-device wireframe costs a fraction of what it did.
+        /// The data sent to the Mac is built separately and in full by `ARMeshManager`.
         private func updateNode(_ node: SCNNode, for meshAnchor: ARMeshAnchor) {
             let geom = meshAnchor.geometry
-            let vertCount = geom.vertices.count
-            let faceCount = geom.faces.count
-            guard vertCount > 0, faceCount > 0 else { return }
+            let vertices = geom.vertices
+            let faces = geom.faces
+            guard vertices.count > 0, faces.count > 0 else { return }
 
-            let vertByteCount = vertCount * geom.vertices.stride
-            let vertData = Data(bytes: geom.vertices.buffer.contents(), count: vertByteCount)
-
-            let normalByteCount = geom.normals.count * geom.normals.stride
-            let normalData = Data(bytes: geom.normals.buffer.contents(), count: normalByteCount)
-
-            let faceByteCount = faceCount * geom.faces.indexCountPerPrimitive * geom.faces.bytesPerIndex
-            let faceData = Data(bytes: geom.faces.buffer.contents(), count: faceByteCount)
-
-            let payload = MeshChunkPayload(
-                id: meshAnchor.identifier,
-                action: .addOrUpdate,
-                transform: meshAnchor.transform,
-                vertexCount: vertCount,
-                normalCount: geom.normals.count,
-                faceCount: faceCount,
-                vertexData: vertData,
-                normalData: normalData,
-                faceData: faceData
+            let vertexSource = SCNGeometrySource(
+                buffer: vertices.buffer,
+                vertexFormat: vertices.format,
+                semantic: .vertex,
+                vertexCount: vertices.count,
+                dataOffset: vertices.offset,
+                dataStride: vertices.stride
+            )
+            let faceData = Data(bytes: faces.buffer.contents(),
+                                count: faces.count * faces.indexCountPerPrimitive * faces.bytesPerIndex)
+            let element = SCNGeometryElement(
+                data: faceData,
+                primitiveType: .triangles,
+                primitiveCount: faces.count,
+                bytesPerIndex: faces.bytesPerIndex
             )
 
-            if let scnGeom = MeshGeometryHelper.makeGeometry(from: payload, mode: .wireframe) {
-                node.geometry = scnGeom
-            }
+            let geometry = SCNGeometry(sources: [vertexSource], elements: [element])
+            geometry.materials = [Self.wireframeMaterial]
+            node.geometry = geometry
         }
+
+        private static let wireframeMaterial: SCNMaterial = {
+            let material = SCNMaterial()
+            material.diffuse.contents = UIColor(red: 0.0, green: 0.88, blue: 1.0, alpha: 1.0)
+            material.lightingModel = .constant
+            material.fillMode = .lines
+            material.isDoubleSided = true
+            return material
+        }()
     }
 }

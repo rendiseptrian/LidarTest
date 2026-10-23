@@ -165,7 +165,8 @@ public final class ARCaptureManager: NSObject, ObservableObject, ARSessionDelega
             depthSize: UInt32(depthPayload.count)
         )
 
-        let packet = LidarPacket(header: header, rgbData: jpegData, depthData: depthPayload)
-        streamer.send(packet: packet)
+        // Depth frames are not part of the mesh stream the Mac app reads, and mixing them into it
+        // would corrupt its framing. Kept for local use; not transmitted.
+        _ = LidarPacket(header: header, rgbData: jpegData, depthData: depthPayload)
     }
 }

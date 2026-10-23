@@ -4,9 +4,11 @@ import simd
 
 public struct SceneKitMeshView: NSViewRepresentable {
     @ObservedObject public var receiver: MeshReceiver
+    @ObservedObject public var measurements: MeasurementStore
 
-    public init(receiver: MeshReceiver) {
+    public init(receiver: MeshReceiver, measurements: MeasurementStore) {
         self.receiver = receiver
+        self.measurements = measurements
     }
 
     public func makeNSView(context: Context) -> SCNView {
@@ -81,9 +83,27 @@ public struct SceneKitMeshView: NSViewRepresentable {
         meshContainer.name = "meshContainer"
         scene.rootNode.addChildNode(meshContainer)
 
+        // 5. Measurement overlay: a sibling of the mesh container, never inside it
+        scene.rootNode.addChildNode(context.coordinator.measurementRenderer.container)
+        scnView.delegate = context.coordinator.measurementRenderer
+
+        // RoomPlan layout lives inside the mesh container so measurement hit tests (rooted
+        // there) land on walls and furniture boxes too. Chunk bookkeeping never touches it.
+        let layoutContainer = SCNNode()
+        layoutContainer.name = "layoutContainer"
+        meshContainer.addChildNode(layoutContainer)
+        context.coordinator.layoutContainer = layoutContainer
+        context.coordinator.gridNode = gridNode
+
         context.coordinator.meshContainer = meshContainer
         context.coordinator.scnView = scnView
+        context.coordinator.measurements = measurements
+        context.coordinator.installMeasureClick(on: scnView)
         receiver.sceneCoordinator = context.coordinator
+        context.coordinator.setMapFrame(receiver.mapFrame)
+        context.coordinator.setLayout(receiver.layout)
+        context.coordinator.setMeshVisible(receiver.showMesh)
+        context.coordinator.setLayoutVisible(receiver.showLayout)
 
         return scnView
     }
@@ -92,54 +112,95 @@ public struct SceneKitMeshView: NSViewRepresentable {
         if let grid = scnView.scene?.rootNode.childNode(withName: "floorGrid", recursively: false) {
             grid.isHidden = !receiver.showGrid
         }
+        context.coordinator.syncMeasurements()
     }
 
     public func makeCoordinator() -> Coordinator {
         Coordinator()
     }
 
-    public class Coordinator {
+    public class Coordinator: NSObject {
         public weak var meshContainer: SCNNode?
+        weak var layoutContainer: SCNNode?
+        weak var gridNode: SCNNode?
         public weak var scnView: SCNView?
+        private var meshVisible = true
+        weak var measurements: MeasurementStore?
+        let measurementRenderer = MeasurementRenderer()
+        var measureClick: NSClickGestureRecognizer?
         private var chunkNodes: [UUID: SCNNode] = [:]
 
-        public func updateChunk(_ payload: MeshChunkPayload, mode: MeshRenderMode) {
+        /// Geometry is built off the main thread by `MeshReceiver`; this only swaps it in.
+        public func setChunk(id: UUID, geometry: SCNGeometry, transform: simd_float4x4) {
+            if let node = chunkNodes[id] {
+                node.geometry = geometry
+                node.simdTransform = transform
+                return
+            }
             guard let container = meshContainer else { return }
+            let node = SCNNode(geometry: geometry)
+            node.name = id.uuidString
+            node.simdTransform = transform
+            // Hundreds of chunk nodes each casting into a 2048² shadow map was a large share of
+            // the GPU cost in big rooms. The floor and walls read fine with SSAO and the key light.
+            node.castsShadow = false
+            node.isHidden = !meshVisible
+            container.addChildNode(node)
+            chunkNodes[id] = node
+        }
 
-            switch payload.action {
-            case .reset:
-                for (_, node) in chunkNodes {
-                    node.removeFromParentNode()
-                }
-                chunkNodes.removeAll()
-
-            case .remove:
-                if let node = chunkNodes.removeValue(forKey: payload.id) {
-                    node.removeFromParentNode()
-                }
-
-            case .addOrUpdate:
-                if let scnGeom = MeshGeometryHelper.makeGeometry(from: payload, mode: mode) {
-                    if let existingNode = chunkNodes[payload.id] {
-                        existingNode.geometry = scnGeom
-                        existingNode.simdTransform = payload.transform
-                    } else {
-                        let newNode = SCNNode(geometry: scnGeom)
-                        newNode.name = payload.id.uuidString
-                        newNode.simdTransform = payload.transform
-                        container.addChildNode(newNode)
-                        chunkNodes[payload.id] = newNode
-                    }
-                }
+        public func setLayout(_ layout: RoomLayout?) {
+            guard let container = layoutContainer else { return }
+            container.childNodes.forEach { $0.removeFromParentNode() }
+            if let layout {
+                container.addChildNode(RoomLayoutRenderer.makeNode(layout))
             }
         }
 
-        public func reloadAllMaterials(chunks: [UUID: MeshChunkPayload], mode: MeshRenderMode) {
-            for (id, payload) in chunks {
-                if let node = chunkNodes[id], let scnGeom = MeshGeometryHelper.makeGeometry(from: payload, mode: mode) {
-                    node.geometry = scnGeom
-                }
+        /// Hidden nodes are skipped by hit tests, so measuring follows what is visible.
+        public func setMeshVisible(_ visible: Bool) {
+            meshVisible = visible
+            chunkNodes.values.forEach { $0.isHidden = !visible }
+        }
+
+        public func setLayoutVisible(_ visible: Bool) {
+            layoutContainer?.isHidden = !visible
+        }
+
+        /// The floor grid is drawn in map coordinates: it lines up with the walls and sits at
+        /// floor level, with a line through the map origin.
+        func setMapFrame(_ frame: MapFrame) {
+            gridNode?.simdTransform = frame.mapToWorld
+        }
+
+        public func removeChunk(id: UUID) {
+            chunkNodes.removeValue(forKey: id)?.removeFromParentNode()
+        }
+
+        public func removeAllChunks() {
+            for node in chunkNodes.values {
+                node.removeFromParentNode()
             }
+            chunkNodes.removeAll()
+        }
+
+        /// Point the camera at the scanned area so a mesh far from the origin is not off-screen.
+        /// Looks along the map's −Z axis, so aligned walls appear square to the screen.
+        func frame(min lo: SIMD3<Float>, max hi: SIMD3<Float>, mapFrame: MapFrame = .scanOrigin) {
+            guard let pov = scnView?.pointOfView else { return }
+            let center = (lo + hi) / 2
+            let radius = Swift.max(simd_length(hi - lo) / 2, 0.5)
+            let offset = simd_float3x3(simd_quatf(angle: mapFrame.yaw, axis: [0, 1, 0])) * SIMD3<Float>(0, radius * 0.9, radius * 1.6)
+            let eye = center + offset
+
+            if let camera = pov.camera {
+                camera.zFar = Swift.max(100, Double(radius) * 8)
+            }
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = 0.5
+            pov.simdPosition = eye
+            pov.simdLook(at: center)
+            SCNTransaction.commit()
         }
 
         public func resetCamera() {
@@ -154,7 +215,7 @@ public struct SceneKitMeshView: NSViewRepresentable {
 
     private func makeFloorGridNode() -> SCNNode {
         let gridContainer = SCNNode()
-        let size: CGFloat = 10.0
+        let size: CGFloat = 30.0 // map origin sits at the plan corner, so the room is in +X/+Z
         let step: CGFloat = 0.5
         let count = Int(size / step)
 

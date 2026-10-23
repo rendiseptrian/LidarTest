@@ -15,6 +15,11 @@ public final class ARMeshManager: NSObject, ObservableObject, ARSessionDelegate 
     public let session = ARSession()
     private let streamer: NetworkStreamer
 
+    /// ARKit delivers mesh anchors here instead of on the main thread. Copying several hundred KB
+    /// of vertex/face buffers per update on the main thread stalled the UI and the send queue in
+    /// large rooms.
+    private let extractionQueue = DispatchQueue(label: "mesh.extract", qos: .userInitiated)
+
     // Cache of active anchors
     private var anchors: [UUID: (vertices: Int, faces: Int)] = [:]
 
@@ -39,23 +44,26 @@ public final class ARMeshManager: NSObject, ObservableObject, ARSessionDelegate 
         return config
     }
 
-    public func startScanning() {
+    // MARK: - Modes
+    //
+    // One ARSession serves both engines. RoomPlan (`RoomScanManager`) and this detail-mesh mode
+    // take turns on it, and tracking is never reset between them, so rooms and mesh share one
+    // world frame. Only `newScan` resets the origin.
+
+    /// Detail mode on: this manager owns the session's delegate and runs scene reconstruction.
+    public func enterMeshMode() {
         guard isSupported else { return }
-
-        let config = makeConfiguration()
-        session.delegate = self
-        session.run(config, options: [.resetTracking, .removeExistingAnchors])
-
-        anchors.removeAll()
-        totalVertices = 0
-        totalFaces = 0
-        activeChunkCount = 0
+        attach()
+        session.run(makeConfiguration())
         isScanning = true
         isPaused = false
+    }
 
-        // Notify client to reset scene
-        let resetPayload = MeshChunkPayload(id: UUID(), action: .reset)
-        streamer.sendMesh(payload: resetPayload)
+    /// Hand the session to RoomPlan. Mesh already captured stays on the Mac and in the snapshot.
+    public func leaveMeshMode() {
+        detach()
+        isScanning = false
+        isPaused = false
     }
 
     public func pauseScanning() {
@@ -64,49 +72,84 @@ public final class ARMeshManager: NSObject, ObservableObject, ARSessionDelegate 
     }
 
     public func resumeScanning() {
-        let config = makeConfiguration()
-        session.run(config)
+        session.run(makeConfiguration())
         isPaused = false
     }
 
-    public func resetScan() {
-        startScanning()
+    /// Starts over: new world origin, all mesh and room data cleared (here and on the Mac).
+    /// `meshMode` decides whether scene reconstruction runs right away.
+    public func newScan(meshMode: Bool) {
+        anchors.removeAll()
+        totalVertices = 0
+        totalFaces = 0
+        activeChunkCount = 0
+        streamer.resetScan()
+
+        if meshMode {
+            attach()
+            session.run(makeConfiguration(), options: [.resetTracking, .removeExistingAnchors])
+            isScanning = true
+            isPaused = false
+        } else {
+            detach()
+            // Plain tracking just to re-origin the world; RoomPlan installs its own configuration
+            // when the first room starts.
+            session.run(ARWorldTrackingConfiguration(), options: [.resetTracking, .removeExistingAnchors])
+            isScanning = false
+        }
+    }
+
+    private func attach() {
+        session.delegateQueue = extractionQueue
+        session.delegate = self
+    }
+
+    /// RoomPlan expects the session's callbacks on the main queue and may install its own delegate.
+    private func detach() {
+        session.delegate = nil
+        session.delegateQueue = nil
     }
 
     // MARK: - ARSessionDelegate
 
+    // Delegate callbacks arrive on `extractionQueue`. Results hop to the main thread with
+    // `DispatchQueue.main.async`, which (unlike spawning a Task per callback) preserves order, so a
+    // removal can never overtake the update that preceded it.
+
     nonisolated public func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
-        let meshAnchors = anchors.compactMap { $0 as? ARMeshAnchor }
-        guard !meshAnchors.isEmpty else { return }
-        Task { @MainActor in
-            self.handleMeshAnchors(meshAnchors, isUpdate: false)
+        let payloads = anchors.compactMap { ($0 as? ARMeshAnchor).flatMap(Self.makePayload) }
+        guard !payloads.isEmpty else { return }
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated { self.apply(payloads) }
         }
     }
 
     nonisolated public func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
-        let meshAnchors = anchors.compactMap { $0 as? ARMeshAnchor }
-        guard !meshAnchors.isEmpty else { return }
-        Task { @MainActor in
-            self.handleMeshAnchors(meshAnchors, isUpdate: true)
+        let payloads = anchors.compactMap { ($0 as? ARMeshAnchor).flatMap(Self.makePayload) }
+        guard !payloads.isEmpty else { return }
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated { self.apply(payloads) }
         }
     }
 
     nonisolated public func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
-        let meshAnchors = anchors.compactMap { $0 as? ARMeshAnchor }
-        guard !meshAnchors.isEmpty else { return }
-        Task { @MainActor in
-            for anchor in meshAnchors {
-                self.anchors.removeValue(forKey: anchor.identifier)
-                let payload = MeshChunkPayload(id: anchor.identifier, action: .remove)
-                self.streamer.sendMesh(payload: payload)
+        let ids = anchors.compactMap { ($0 as? ARMeshAnchor)?.identifier }
+        guard !ids.isEmpty else { return }
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                for id in ids {
+                    self.anchors.removeValue(forKey: id)
+                    self.streamer.remove(id: id)
+                }
+                self.updateTotals()
             }
-            self.updateTotals()
         }
     }
 
     nonisolated public func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
-        Task { @MainActor in
-            switch camera.trackingState {
+        let trackingState = camera.trackingState
+        DispatchQueue.main.async { MainActor.assumeIsolated {
+            switch trackingState {
             case .normal:
                 self.trackingStatus = "Tracking: Normal"
             case .limited(let reason):
@@ -120,59 +163,57 @@ public final class ARMeshManager: NSObject, ObservableObject, ARSessionDelegate 
             case .notAvailable:
                 self.trackingStatus = "Tracking: Unavailable"
             }
-        }
+        } }
     }
 
     // MARK: - Process Mesh Anchors
 
-    private func handleMeshAnchors(_ meshAnchors: [ARMeshAnchor], isUpdate: Bool) {
-        for anchor in meshAnchors {
-            let geom = anchor.geometry
+    private func apply(_ payloads: [MeshChunkPayload]) {
+        for payload in payloads {
+            anchors[payload.id] = (payload.vertexCount, payload.faceCount)
+            streamer.upsert(payload)
+        }
+        updateTotals()
+    }
 
-            let vertCount = geom.vertices.count
-            let faceCount = geom.faces.count
-            guard vertCount > 0, faceCount > 0 else { continue }
+    /// Copies one anchor's buffers. Positions stay Float32 metres in anchor-local space; the
+    /// anchor transform carries them into world space. Nothing here is lossy.
+    nonisolated private static func makePayload(from anchor: ARMeshAnchor) -> MeshChunkPayload? {
+        let geom = anchor.geometry
+        let vertCount = geom.vertices.count
+        let faceCount = geom.faces.count
+        guard vertCount > 0, faceCount > 0 else { return nil }
 
-            // Extract vertex buffer
-            let vertByteCount = vertCount * geom.vertices.stride
-            let vertData = Data(bytes: geom.vertices.buffer.contents(), count: vertByteCount)
+        let vertices = geom.vertices
+        let vertData = Data(bytes: vertices.buffer.contents().advanced(by: vertices.offset),
+                            count: vertCount * vertices.stride)
 
-            // Extract normal buffer
-            let normalByteCount = geom.normals.count * geom.normals.stride
-            let normalData = Data(bytes: geom.normals.buffer.contents(), count: normalByteCount)
+        let normals = geom.normals
+        let normalData = Data(bytes: normals.buffer.contents().advanced(by: normals.offset),
+                              count: normals.count * normals.stride)
 
-            // Extract face buffer (triangles, 3 indices per face)
-            let faceByteCount = faceCount * geom.faces.indexCountPerPrimitive * geom.faces.bytesPerIndex
-            let faceData = Data(bytes: geom.faces.buffer.contents(), count: faceByteCount)
+        let faces = geom.faces
+        let faceData = Data(bytes: faces.buffer.contents(),
+                            count: faceCount * faces.indexCountPerPrimitive * faces.bytesPerIndex)
 
-            // Extract classification buffer if available
-            var classData = Data()
-            if let classification = geom.classification {
-                let classByteCount = classification.count * classification.stride
-                classData = Data(bytes: classification.buffer.contents(), count: classByteCount)
-            }
-
-            // Cache statistics
-            self.anchors[anchor.identifier] = (vertCount, faceCount)
-
-            // Build payload and transmit
-            let payload = MeshChunkPayload(
-                id: anchor.identifier,
-                action: .addOrUpdate,
-                transform: anchor.transform,
-                vertexCount: vertCount,
-                normalCount: geom.normals.count,
-                faceCount: faceCount,
-                vertexData: vertData,
-                normalData: normalData,
-                faceData: faceData,
-                classificationData: classData
-            )
-
-            streamer.sendMesh(payload: payload)
+        var classData = Data()
+        if let classification = geom.classification {
+            classData = Data(bytes: classification.buffer.contents().advanced(by: classification.offset),
+                             count: classification.count * classification.stride)
         }
 
-        updateTotals()
+        return MeshChunkPayload(
+            id: anchor.identifier,
+            action: .addOrUpdate,
+            transform: anchor.transform,
+            vertexCount: vertCount,
+            normalCount: normals.count,
+            faceCount: faceCount,
+            vertexData: vertData,
+            normalData: normalData,
+            faceData: faceData,
+            classificationData: classData
+        )
     }
 
     private func updateTotals() {

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Bonjour service types the app may browse/advertise. iOS refuses discovery of any type not
+	     listed here. Must be a real plist array: the INFOPLIST_KEY_NSBonjourServices build setting
+	     is not supported by Xcode's generated Info.plist and is silently dropped.
+	     Must match NetworkUtils.bonjourServiceType. Everything else comes from INFOPLIST_KEY_*
+	     build settings and is merged in at build time. -->
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_lidar-stream._tcp</string>
+	</array>
+</dict>
+</plist>

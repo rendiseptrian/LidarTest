@@ -329,7 +329,7 @@ public final class LidarReceiver: ObservableObject {
         let cmap = self.selectedColorMap
         let depthData = packet.depthData
 
-        DispatchQueue.global(qos: .userInteractive).async {
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             let rendered = ColorMaps.renderDepthImage(
                 from: depthData,
                 width: w,
@@ -339,9 +339,11 @@ public final class LidarReceiver: ObservableObject {
                 colormap: cmap
             )
 
-            Task { @MainActor [weak self] in
-                self?.depthImage = rendered
-                self?.updateProbeDistance()
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    self?.depthImage = rendered
+                    self?.updateProbeDistance()
+                }
             }
         }
     }
@@ -355,7 +357,7 @@ public final class LidarReceiver: ObservableObject {
         let cmap = self.selectedColorMap
         let depthData = packet.depthData
 
-        DispatchQueue.global(qos: .userInitiated).async {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let rendered = ColorMaps.renderDepthImage(
                 from: depthData,
                 width: w,
@@ -365,8 +367,8 @@ public final class LidarReceiver: ObservableObject {
                 colormap: cmap
             )
 
-            Task { @MainActor [weak self] in
-                self?.depthImage = rendered
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.depthImage = rendered }
             }
         }
     }

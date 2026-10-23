@@ -3,31 +3,38 @@ import Network
 import Combine
 import QuartzCore
 import simd
+import os
 
 public enum MeshConnectionStatus: Equatable {
-    case disconnected
-    case searching
-    case connecting(String)
+    case stopped
+    case listening
     case connected(String)
     case failed(String)
 
     public var title: String {
         switch self {
-        case .disconnected: return "Disconnected"
-        case .searching: return "Listening for iPhone..."
-        case .connecting(let h): return "Connecting to \(h)..."
+        case .stopped: return "Stopped"
+        case .listening: return "Waiting for iPhone..."
         case .connected(let h): return "Connected: \(h)"
         case .failed(let err): return "Failed: \(err)"
         }
     }
 }
 
+/// The Mac is listen-only. It advertises itself over Bonjour; the iPhone finds it and connects.
+///
+/// Threading: socket reads and decoding run on `netQueue` (`MeshStreamReader`), geometry building
+/// and bounds measurement on `buildQueue` (`PreparedChunk`), and only the cheap scene-graph swap
+/// and bookkeeping on the main thread. Both queues are serial and results reach main via
+/// `DispatchQueue.main.async`, so messages are applied in exactly the order they were sent.
+///
+/// The scene is never cleared because a connection dropped. The phone resends everything plus a
+/// `.sync` manifest when it reconnects, which brings this mirror back in line.
 @MainActor
 public final class MeshReceiver: ObservableObject {
-    @Published public var host: String = "10.60.50.88"
-    @Published public var port: UInt16 = 8088
+    @Published public private(set) var port: UInt16 = NetworkUtils.defaultPort
     @Published public private(set) var localIP: String = NetworkUtils.getLocalIPAddress() ?? "127.0.0.1"
-    @Published public private(set) var status: MeshConnectionStatus = .disconnected
+    @Published public private(set) var status: MeshConnectionStatus = .stopped
     @Published public private(set) var isListening: Bool = false
 
     // Geometry Telemetry
@@ -43,335 +50,493 @@ public final class MeshReceiver: ObservableObject {
     // Render Settings
     @Published public var renderMode: MeshRenderMode = .realistic {
         didSet {
-            sceneCoordinator?.reloadAllMaterials(chunks: cachedChunks, mode: renderMode)
+            guard renderMode != oldValue else { return }
+            modeBox.value = renderMode
+            rebuildAllChunks()
         }
     }
     @Published public var showGrid: Bool = true
+    @Published public var showMesh: Bool = true {
+        didSet { sceneCoordinator?.setMeshVisible(showMesh) }
+    }
+    @Published public var showLayout: Bool = true {
+        didSet { sceneCoordinator?.setLayoutVisible(showLayout) }
+    }
+
+    /// RoomPlan's structured rooms (walls, doors, windows, furniture), when the iPhone sends one.
+    @Published public private(set) var layout: RoomLayout?
+    /// How the map is oriented and where its origin is. See `MapFrame`.
+    @Published private(set) var mapFrame = MapFrame(mode: .autoAligned, origin: .zero, yaw: 0)
 
     public weak var sceneCoordinator: SceneKitMeshView.Coordinator?
 
-    private var cachedChunks: [UUID: MeshChunkPayload] = [:]
-    private var connection: NWConnection?
+    /// Connection events and scene stats. Watch live with Console.app, or:
+    /// `log stream --level debug --predicate 'subsystem == "c7.LidarTest"'`
+    private let log = Logger(subsystem: "c7.LidarTest", category: "MeshReceiver")
+
+    // Tuning
+    /// The phone heartbeats every 2 s when idle; this much silence means the link is dead even if
+    /// TCP has not noticed yet.
+    private let silenceTimeout: TimeInterval = 12
+    private let listenerRetryDelay: TimeInterval = 2
+
+    // Pipeline
+    private let netQueue = DispatchQueue(label: "mesh.net", qos: .userInitiated)
+    private let buildQueue = DispatchQueue(label: "mesh.build", qos: .userInitiated)
+    private let modeBox = LockedValue<MeshRenderMode>(.realistic)
     private var listener: NWListener?
-    private var isRunning: Bool = false
-    private var reconnectTask: Task<Void, Never>?
+    private var reader: MeshStreamReader?
+    private var readerID = 0
+    private var listenerRetryTask: Task<Void, Never>?
+    private var tickTimer: Timer?
+    private var lastPacketTime: TimeInterval = 0
 
-    private var packetCount: Int = 0
+    // Scene mirror
+    private struct ChunkRecord {
+        var payload: MeshChunkPayload
+        var version: Int
+        var boundsMin: SIMD3<Float>
+        var boundsMax: SIMD3<Float>
+        var hasBounds: Bool
+    }
+    private var chunks: [UUID: ChunkRecord] = [:]
+    private var nextVersion = 1
+    private var runningVertices = 0
+    private var runningFaces = 0
+    private var statsDirty = false
+    private var hasAutoFramed = false
+    private var layoutPayload: MeshChunkPayload?
+    private var layoutBounds: (min: SIMD3<Float>, max: SIMD3<Float>)?
+    private var lastAutoAlign: TimeInterval = 0
+    private var autoAlignInFlight = false
+
+    // Metrics
+    private var packetCount = 0
     private var byteCount: Int64 = 0
-    private var lastMetricsTime: TimeInterval = 0
+    private var lastMetricsTime: TimeInterval = CACurrentMediaTime()
 
-    public init() {
-        self.localIP = NetworkUtils.getLocalIPAddress() ?? "127.0.0.1"
-    }
+    public init() {}
 
-    // MARK: - Connection Management
+    // MARK: - Listening
 
-    public func connect() {
-        disconnect()
-
-        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedHost.isEmpty else { return }
-
-        status = .connecting(trimmedHost)
-        isRunning = true
-
-        let endpointHost = NWEndpoint.Host(trimmedHost)
-        let endpointPort = NWEndpoint.Port(rawValue: port) ?? NWEndpoint.Port(8088)
-
-        let tcpOptions = NWProtocolTCP.Options()
-        tcpOptions.enableFastOpen = true
-        tcpOptions.noDelay = true
-        tcpOptions.enableKeepalive = true
-        tcpOptions.keepaliveIdle = 2
-        tcpOptions.keepaliveInterval = 1
-        tcpOptions.keepaliveCount = 5
-
-        let params = NWParameters(tls: nil, tcp: tcpOptions)
-        params.allowLocalEndpointReuse = true
-        params.includePeerToPeer = true
-        params.serviceClass = .interactiveVideo
-
-        let conn = NWConnection(host: endpointHost, port: endpointPort, using: params)
-        self.connection = conn
-
-        conn.stateUpdateHandler = { [weak self] state in
-            Task { @MainActor [weak self] in
-                guard let self = self, self.isRunning else { return }
-                switch state {
-                case .ready:
-                    self.status = .connected(trimmedHost)
-                    self.lastMetricsTime = CACurrentMediaTime()
-                    self.reconnectTask?.cancel()
-                    self.reconnectTask = nil
-                    self.readNextPacket()
-                case .failed(let error):
-                    self.handleDisconnection(error: error.localizedDescription)
-                case .cancelled:
-                    if case .connecting = self.status {
-                        self.handleDisconnection(error: nil)
-                    }
-                default:
-                    break
-                }
-            }
-        }
-
-        conn.start(queue: .main)
-    }
-
-    private func handleDisconnection(error: String?) {
-        if let error = error {
-            self.status = .failed(error)
-        } else {
-            self.status = .disconnected
-        }
-        connection?.cancel()
-        connection = nil
-
-        // Auto-reconnect if client mode was active
-        if isRunning && !isListening && reconnectTask == nil {
-            reconnectTask = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
-                guard !Task.isCancelled, self.isRunning, !self.isListening else { return }
-                self.connect()
-            }
-        }
-    }
-
-    public func startListening(port: UInt16 = 8088) {
-        disconnect()
-        self.port = port
-        self.localIP = NetworkUtils.getLocalIPAddress() ?? "127.0.0.1"
-        status = .searching
-        isRunning = true
+    public func startListening() {
+        stopListening()
+        localIP = NetworkUtils.getLocalIPAddress() ?? "127.0.0.1"
         isListening = true
+        status = .listening
+        startTicker()
+        makeListener()
+    }
 
+    public func stopListening() {
+        isListening = false
+        listenerRetryTask?.cancel()
+        listenerRetryTask = nil
+        tickTimer?.invalidate()
+        tickTimer = nil
+        listener?.cancel()
+        listener = nil
+        dropConnection()
+        status = .stopped
+    }
+
+    private func makeListener() {
+        guard isListening else { return }
         do {
-            let nwPort = NWEndpoint.Port(rawValue: port) ?? NWEndpoint.Port(8088)
-            let tcpOptions = NWProtocolTCP.Options()
-            tcpOptions.enableFastOpen = true
-            tcpOptions.noDelay = true
-            tcpOptions.enableKeepalive = true
-            tcpOptions.keepaliveIdle = 2
-            tcpOptions.keepaliveInterval = 1
-            tcpOptions.keepaliveCount = 5
-
-            let params = NWParameters(tls: nil, tcp: tcpOptions)
-            params.allowLocalEndpointReuse = true
-            params.includePeerToPeer = true
-            params.serviceClass = .interactiveVideo
-
-            let newListener = try NWListener(using: params, on: nwPort)
-            newListener.service = NWListener.Service(type: "_lidartest._tcp")
+            let nwPort = NWEndpoint.Port(rawValue: port)!
+            let newListener = try NWListener(using: NetworkUtils.makeTCPParameters(), on: nwPort)
+            // Advertised under the Mac's computer name, which the phone shows when it finds it.
+            newListener.service = NWListener.Service(type: NetworkUtils.bonjourServiceType)
 
             newListener.stateUpdateHandler = { [weak self] state in
                 Task { @MainActor [weak self] in
-                    guard let self = self, self.isRunning else { return }
-                    switch state {
-                    case .ready:
-                        self.status = .searching
-                    case .failed(let err):
+                    guard let self, self.isListening else { return }
+                    if case .failed(let err) = state {
+                        // e.g. port still held by a previous run. Keep trying instead of giving up.
                         self.status = .failed("Listener: \(err.localizedDescription)")
-                        self.disconnect()
-                    default:
-                        break
+                        self.listener?.cancel()
+                        self.listener = nil
+                        self.scheduleListenerRetry()
                     }
                 }
             }
 
             newListener.newConnectionHandler = { [weak self] conn in
                 Task { @MainActor [weak self] in
-                    guard let self = self else { return }
-                    self.connection?.cancel()
-                    self.connection = conn
-
-                    conn.stateUpdateHandler = { [weak self] state in
-                        Task { @MainActor [weak self] in
-                            guard let self = self, self.isRunning else { return }
-                            switch state {
-                            case .ready:
-                                self.status = .connected("\(conn.endpoint)")
-                                self.lastMetricsTime = CACurrentMediaTime()
-                                self.readNextPacket()
-                            case .failed(let err):
-                                self.status = .failed(err.localizedDescription)
-                                self.disconnect()
-                            default:
-                                break
-                            }
-                        }
-                    }
-
-                    conn.start(queue: .main)
+                    self?.accept(conn)
                 }
             }
 
             newListener.start(queue: .main)
-            self.listener = newListener
+            listener = newListener
         } catch {
-            self.status = .failed("Listener error: \(error.localizedDescription)")
+            status = .failed("Listener: \(error.localizedDescription)")
+            scheduleListenerRetry()
         }
     }
 
-    public func disconnect() {
-        isRunning = false
-        connection?.cancel()
-        connection = nil
-        listener?.cancel()
-        listener = nil
-        isListening = false
-        status = .disconnected
+    private func scheduleListenerRetry() {
+        guard isListening, listenerRetryTask == nil else { return }
+        listenerRetryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64((self?.listenerRetryDelay ?? 2) * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            self.listenerRetryTask = nil
+            self.makeListener()
+        }
     }
 
-    public func clearScene() {
-        cachedChunks.removeAll()
-        totalVertices = 0
-        totalFaces = 0
-        activeChunkCount = 0
-        roomDimensions = "--"
-        let resetPayload = MeshChunkPayload(id: UUID(), action: .reset)
-        sceneCoordinator?.updateChunk(resetPayload, mode: renderMode)
-    }
+    /// The newest connection always wins. After a silent drop the phone reconnects before this
+    /// side has noticed the old socket is dead; refusing it would stall the scan.
+    private func accept(_ conn: NWConnection) {
+        guard isListening else { conn.cancel(); return }
+        dropConnection()
 
-    // MARK: - Packet Loop
+        readerID += 1
+        let id = readerID
+        let endpoint = "\(conn.endpoint)"
+        let modeBox = self.modeBox
+        let buildQueue = self.buildQueue
 
-    private func readNextPacket() {
-        guard let conn = connection, isRunning else { return }
-
-        // Read 4-byte length prefix
-        conn.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, isComplete, error in
-            Task { @MainActor [weak self] in
-                guard let self = self, self.isRunning else { return }
-
-                if let error = error {
-                    self.status = .failed("Read error: \(error.localizedDescription)")
-                    return
+        let newReader = MeshStreamReader(
+            connection: conn,
+            queue: netQueue,
+            onReady: { [weak self] in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { self?.connectionReady(id: id, endpoint: endpoint) }
                 }
-
-                guard let data = data, data.count == 4 else {
-                    if isComplete { self.disconnect() }
-                    return
+            },
+            onPayload: { [weak self] payload, wireBytes in
+                buildQueue.async {
+                    let prepared = PreparedChunk.make(payload, mode: modeBox.value, wireBytes: wireBytes)
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated { self?.apply(prepared, readerID: id) }
+                    }
                 }
-
-                let payloadLength = data.withUnsafeBytes { ptr in
-                    UInt32(bigEndian: ptr.load(as: UInt32.self))
+            },
+            onClose: { [weak self] reason in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { self?.connectionClosed(id: id, reason: reason) }
                 }
-
-                self.readPayload(length: Int(payloadLength))
             }
-        }
+        )
+        reader = newReader
+        newReader.start()
     }
 
-    private func readPayload(length: Int) {
-        guard let conn = connection, isRunning, length > 0 else { return }
-
-        conn.receive(minimumIncompleteLength: length, maximumLength: length) { [weak self] data, _, isComplete, error in
-            Task { @MainActor [weak self] in
-                guard let self = self, self.isRunning else { return }
-
-                if let error = error {
-                    self.status = .failed("Payload error: \(error.localizedDescription)")
-                    return
-                }
-
-                guard let data = data, data.count == length else {
-                    if isComplete { self.disconnect() }
-                    return
-                }
-
-                self.processIncomingPayload(data)
-                self.readNextPacket()
-            }
-        }
+    private func connectionReady(id: Int, endpoint: String) {
+        guard id == readerID else { return }
+        status = .connected(endpoint)
+        log.info("connected: \(endpoint, privacy: .public)")
+        lastPacketTime = CACurrentMediaTime()
+        packetCount = 0
+        byteCount = 0
+        lastMetricsTime = lastPacketTime
     }
 
-    private func processIncomingPayload(_ data: Data) {
-        guard let meshPayload = MeshChunkPayload.deserialize(from: data) else { return }
+    private func connectionClosed(id: Int, reason: String?) {
+        guard id == readerID else { return }
+        reader = nil
+        fps = 0
+        bitrateMBs = 0
+        guard isListening else { return }
+        status = .listening
+        log.info("connection closed: \(reason ?? "peer closed", privacy: .public)")
+    }
 
-        // Ignore empty heartbeat probes
-        if meshPayload.vertexCount == 0 && meshPayload.faceCount == 0 && meshPayload.action == .addOrUpdate {
+    private func dropConnection() {
+        readerID += 1 // anything still in flight from the old connection is ignored
+        reader?.cancel()
+        reader = nil
+    }
+
+    // MARK: - Applying chunks (main thread)
+
+    private func apply(_ prepared: PreparedChunk, readerID id: Int) {
+        let payload = prepared.payload
+
+        if prepared.rebuildOfVersion != 0 {
+            // A render-mode rebuild: only valid if the chunk has not changed or vanished since.
+            guard let record = chunks[payload.id], record.version == prepared.rebuildOfVersion,
+                  prepared.mode == renderMode, let geometry = prepared.geometry else { return }
+            sceneCoordinator?.setChunk(id: payload.id, geometry: geometry, transform: payload.transform)
             return
         }
 
-        self.byteCount += Int64(data.count + 4)
-        self.packetCount += 1
-
-        let now = CACurrentMediaTime()
-        let elapsed = now - lastMetricsTime
-        if elapsed >= 0.5 {
-            self.fps = Double(packetCount) / elapsed
-            self.bitrateMBs = (Double(byteCount) / 1_048_576.0) / elapsed
-            self.packetCount = 0
-            self.byteCount = 0
-            self.lastMetricsTime = now
+        let isLocal = id == Self.localSourceID
+        guard isLocal || id == readerID else { return }
+        if !isLocal {
+            lastPacketTime = CACurrentMediaTime()
+            packetCount += 1
+            byteCount += Int64(prepared.wireBytes)
         }
 
-        switch meshPayload.action {
+        switch payload.action {
+        case .heartbeat:
+            return
+
         case .reset:
-            cachedChunks.removeAll()
-            sceneCoordinator?.updateChunk(meshPayload, mode: renderMode)
+            removeAllChunks()
+
+        case .sync:
+            let live = payload.manifestIDs
+            for staleID in chunks.keys where !live.contains(staleID) {
+                removeChunk(staleID)
+            }
+            if !live.contains(RoomLayout.payloadID) { setLayout(nil) }
 
         case .remove:
-            cachedChunks.removeValue(forKey: meshPayload.id)
-            sceneCoordinator?.updateChunk(meshPayload, mode: renderMode)
+            if payload.id == RoomLayout.payloadID {
+                setLayout(nil)
+            } else {
+                removeChunk(payload.id)
+            }
+
+        case .layout:
+            setLayout(payload)
 
         case .addOrUpdate:
-            cachedChunks[meshPayload.id] = meshPayload
-            sceneCoordinator?.updateChunk(meshPayload, mode: renderMode)
-        }
+            guard let geometry = prepared.geometry else { return }
+            if let old = chunks[payload.id] {
+                runningVertices -= old.payload.vertexCount
+                runningFaces -= old.payload.faceCount
+            }
+            let version = nextVersion
+            nextVersion += 1
+            chunks[payload.id] = ChunkRecord(payload: payload, version: version,
+                                             boundsMin: prepared.boundsMin, boundsMax: prepared.boundsMax,
+                                             hasBounds: prepared.hasBounds)
+            runningVertices += payload.vertexCount
+            runningFaces += payload.faceCount
+            sceneCoordinator?.setChunk(id: payload.id, geometry: geometry, transform: payload.transform)
 
-        updateMeshTotals()
+            if prepared.mode != renderMode {
+                rebuild(payload.id)
+            }
+        }
+        statsDirty = true
     }
 
-    private func updateMeshTotals() {
-        var vSum = 0
-        var fSum = 0
+    private func removeChunk(_ id: UUID) {
+        guard let old = chunks.removeValue(forKey: id) else { return }
+        runningVertices -= old.payload.vertexCount
+        runningFaces -= old.payload.faceCount
+        sceneCoordinator?.removeChunk(id: id)
+        statsDirty = true
+    }
 
-        var minX: Float = .greatestFiniteMagnitude
-        var maxX: Float = -.greatestFiniteMagnitude
-        var minY: Float = .greatestFiniteMagnitude
-        var maxY: Float = -.greatestFiniteMagnitude
-        var minZ: Float = .greatestFiniteMagnitude
-        var maxZ: Float = -.greatestFiniteMagnitude
+    /// Clears mesh and room layout: everything the iPhone streamed.
+    private func removeAllChunks() {
+        chunks.removeAll()
+        runningVertices = 0
+        runningFaces = 0
+        hasAutoFramed = false
+        sceneCoordinator?.removeAllChunks()
+        setLayout(nil)
+        statsDirty = true
+    }
 
-        for (_, chunk) in cachedChunks {
-            vSum += chunk.vertexCount
-            fSum += chunk.faceCount
+    private func setLayout(_ payload: MeshChunkPayload?) {
+        guard let payload, let decoded = RoomLayout(payload: payload) else {
+            guard layoutPayload != nil || layout != nil else { return }
+            layoutPayload = nil
+            layout = nil
+            layoutBounds = nil
+            sceneCoordinator?.setLayout(nil)
+            statsDirty = true
+            return
+        }
+        layoutPayload = payload
+        layout = decoded
+        log.debug("layout: \(decoded.rooms.count, privacy: .public) rooms, \(decoded.surfaces.count, privacy: .public) surfaces, \(decoded.objects.count, privacy: .public) objects")
+        var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var hi = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        for p in decoded.surfaces.flatMap(\.boxCorners) + decoded.objects.flatMap(\.footprint) {
+            lo = simd_min(lo, p)
+            hi = simd_max(hi, p)
+        }
+        layoutBounds = lo.x <= hi.x ? (lo, hi) : nil
+        sceneCoordinator?.setLayout(decoded)
+        statsDirty = true
+    }
 
-            let transform = chunk.transform
-            let count = chunk.vertexCount
-            guard count > 0, chunk.vertexData.count >= count * 12 else { continue }
+    public func clearScene() {
+        removeAllChunks()
+        publishStats()
+    }
 
-            chunk.vertexData.withUnsafeBytes { raw in
-                let floats = raw.bindMemory(to: Float32.self)
-                for i in stride(from: 0, to: count * 3, by: 9) { // sample vertices
-                    let lx = floats[i]
-                    let ly = floats[i + 1]
-                    let lz = floats[i + 2]
-                    let localPos = simd_float4(lx, ly, lz, 1.0)
-                    let worldPos = transform * localPos
+    public func frameScene() {
+        guard let bounds = sceneBounds() else {
+            sceneCoordinator?.resetCamera()
+            return
+        }
+        sceneCoordinator?.frame(min: bounds.min, max: bounds.max, mapFrame: mapFrame)
+    }
 
-                    if worldPos.x < minX { minX = worldPos.x }
-                    if worldPos.x > maxX { maxX = worldPos.x }
-                    if worldPos.y < minY { minY = worldPos.y }
-                    if worldPos.y > maxY { maxY = worldPos.y }
-                    if worldPos.z < minZ { minZ = worldPos.z }
-                    if worldPos.z > maxZ { maxZ = worldPos.z }
+    private func rebuildAllChunks() {
+        for id in chunks.keys { rebuild(id) }
+    }
+
+    private func rebuild(_ id: UUID) {
+        guard let record = chunks[id] else { return }
+        let payload = record.payload
+        let version = record.version
+        let mode = renderMode
+        buildQueue.async { [weak self] in
+            let prepared = PreparedChunk.make(payload, mode: mode, wireBytes: 0, rebuildOfVersion: version)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.apply(prepared, readerID: 0) }
+            }
+        }
+    }
+
+    // MARK: - Stats & watchdog
+
+    private func startTicker() {
+        tickTimer?.invalidate()
+        tickTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
+        }
+    }
+
+    private func tick() {
+        let now = CACurrentMediaTime()
+
+        if case .connected = status, now - lastPacketTime > silenceTimeout {
+            log.info("no data for \(self.silenceTimeout, privacy: .public)s, dropping connection")
+            dropConnection()
+            status = .listening
+            fps = 0
+            bitrateMBs = 0
+        }
+
+        let elapsed = now - lastMetricsTime
+        if elapsed >= 1.0 {
+            fps = Double(packetCount) / elapsed
+            bitrateMBs = (Double(byteCount) / 1_048_576.0) / elapsed
+            packetCount = 0
+            byteCount = 0
+            lastMetricsTime = now
+        }
+
+        if statsDirty {
+            publishStats()
+        }
+    }
+
+    private func publishStats() {
+        statsDirty = false
+        totalVertices = runningVertices
+        totalFaces = runningFaces
+        activeChunkCount = chunks.count
+        log.debug("scene: \(self.chunks.count, privacy: .public) chunks, \(self.runningVertices, privacy: .public) vertices")
+
+        guard let bounds = sceneBounds() else {
+            roomDimensions = "--"
+            return
+        }
+        let size = bounds.max - bounds.min
+        roomDimensions = String(format: "%.2f m × %.2f m × %.2f m", size.x, size.y, size.z)
+
+        refreshAutoAlignment()
+        if !hasAutoFramed {
+            hasAutoFramed = true
+            sceneCoordinator?.frame(min: bounds.min, max: bounds.max, mapFrame: mapFrame)
+        }
+    }
+
+    /// Union of per-chunk world bounds. O(chunks), not O(vertices).
+    private func sceneBounds() -> (min: SIMD3<Float>, max: SIMD3<Float>)? {
+        var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var hi = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        var any = false
+        for record in chunks.values where record.hasBounds {
+            lo = simd_min(lo, record.boundsMin)
+            hi = simd_max(hi, record.boundsMax)
+            any = true
+        }
+        if let layoutBounds {
+            lo = simd_min(lo, layoutBounds.min)
+            hi = simd_max(hi, layoutBounds.max)
+            any = true
+        }
+        return any ? (lo, hi) : nil
+    }
+
+    // MARK: - Map frame
+
+    /// Walls to axes, floor to y = 0, origin at the plan corner. Keeps following the scan.
+    public func autoAlignMap() {
+        mapFrame = MapFrame(mode: .autoAligned, origin: mapFrame.origin, yaw: mapFrame.yaw)
+        lastAutoAlign = 0
+        refreshAutoAlignment(force: true)
+    }
+
+    /// Origin at the measurement's start, +X along it. Returns false for a vertical measurement.
+    @discardableResult
+    func setMapFrame(from measurement: RoomMeasurement) -> Bool {
+        guard let frame = MapFrame.fromMeasurement(start: measurement.start, end: measurement.end) else { return false }
+        applyMapFrame(frame)
+        return true
+    }
+
+    public func useScanOrigin() {
+        applyMapFrame(.scanOrigin)
+    }
+
+    func applyMapFrame(_ frame: MapFrame) {
+        mapFrame = frame
+        sceneCoordinator?.setMapFrame(frame)
+    }
+
+    /// Recomputed at most every 2 s, off the main thread when it has to read the mesh.
+    private func refreshAutoAlignment(force: Bool = false) {
+        guard mapFrame.mode == .autoAligned, !autoAlignInFlight else { return }
+        let now = CACurrentMediaTime()
+        guard force || now - lastAutoAlign >= 2 else { return }
+        lastAutoAlign = now
+
+        let layout = self.layout
+        // RoomPlan walls are exact and cheap; the mesh is only needed when there is no layout.
+        let payloads = (layout?.isEmpty ?? true) ? exportPayloads().filter { $0.action == .addOrUpdate } : []
+        autoAlignInFlight = true
+        buildQueue.async { [weak self] in
+            let frame = MapFrame.autoAligned(layout: layout, payloads: payloads)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.autoAlignInFlight = false
+                    guard let frame, self.mapFrame.mode == .autoAligned else { return }
+                    self.applyMapFrame(frame)
                 }
             }
         }
+    }
 
-        self.totalVertices = vSum
-        self.totalFaces = fSum
-        self.activeChunkCount = cachedChunks.count
+    // MARK: - Saving & opening scans
 
-        if minX < maxX && minY < maxY && minZ < maxZ {
-            let dx = maxX - minX
-            let dy = maxY - minY
-            let dz = maxZ - minZ
-            self.roomDimensions = String(format: "%.1f m × %.1f m × %.1f m", dx, dy, dz)
-        } else {
-            self.roomDimensions = "--"
+    /// `apply` source tag for chunks read from a file rather than the network.
+    private static let localSourceID = -1
+
+    /// Every chunk currently in the scene, plus the room layout, for saving or exporting.
+    public func exportPayloads() -> [MeshChunkPayload] {
+        chunks.values.map(\.payload) + (layoutPayload.map { [$0] } ?? [])
+    }
+
+    /// Replaces the scene with a saved scan. Stops listening first: a connected iPhone's `.sync`
+    /// manifest would otherwise delete the opened scan. Press Listen again to resume live scanning.
+    func loadScan(_ payloads: [MeshChunkPayload], mapFrame frame: MapFrame?) {
+        if isListening { stopListening() }
+        removeAllChunks()
+        applyMapFrame(frame ?? MapFrame(mode: .autoAligned, origin: .zero, yaw: 0))
+        lastAutoAlign = 0
+        let modeBox = self.modeBox
+        for payload in payloads where payload.action == .addOrUpdate || payload.action == .layout {
+            buildQueue.async { [weak self] in
+                let prepared = PreparedChunk.make(payload, mode: modeBox.value, wireBytes: 0)
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { self?.apply(prepared, readerID: Self.localSourceID) }
+                }
+            }
         }
     }
 }
